@@ -1,3 +1,7 @@
+# 自定义Prometheus Exporter拉取MongoDB内的数据
+
+## 实现Exporter部分
+
 很多时候，我们在使用Prometheus时，官方提供的采集组件不能满足监控需求，我们就需要自行编写Exporter。
 
 本文的示例采用go语言和Gauge (测量指标)类型实现。自定义Exporter去取MongoDB里动态增长的数据。
@@ -239,3 +243,280 @@ type AllData struct {
 ```
 
 mongodb.QueryAllData()是另外从mongodb中拉取数据的模块，返回AllData类型数据。mongodb模块每三分钟去数据库里拉一次数据。
+
+## 实现MongoDB部分
+
+### MongoDB的Go驱动包
+
+```
+"go.mongodb.org/mongo-driver/bson"    //BOSN解析包
+"go.mongodb.org/mongo-driver/mongo"    //MongoDB的Go驱动包
+"go.mongodb.org/mongo-driver/mongo/options"
+```
+
+###### BSON简介
+
+BSON是一种类json的一种二进制形式的存储格式，简称Binary JSON。MongoDB使用了BSON这种结构来存储数据和网络数据交换。
+
+BSON对应`Document`这个概念，因为BSON是schema-free的，所以在MongoDB中所对应的`Document`也有这个特征，这里的一个`Document`也可以理解成关系数据库中的一条`Record`，只是`Document`的变化更丰富一些，`Document`可以嵌套。
+
+MongoDB以BSON做为其存储结构的一个重要原因是它的`可遍历性`。
+
+BSON编码扩展了JSON表示，使其包含额外的类型，如int、long、date、浮点数和decimal128。
+
+###### BSON类型
+
+BSON数据的主要类型有：`A`，`D`，`E`，`M`和`Raw`。其中，`A`是数组，`D`是切片，`M`是映射，`D`和`M`是Go原生类型。
+
+- `A`类型表示有序的BSON数组。
+
+  ```
+  bson.A{"bar", "world", 3.14159, bson.D{{"qux", 12345}}}
+  ```
+
+- `D`类型表示包含有序元素的BSON文档。这种类型应该在顺序重要的情况下使用。如果元素的顺序无关紧要，则应使用M代替。
+
+  ```
+  bson.D{{"foo", "bar"}, {"hello", "world"}, {"pi", 3.14159}}
+  ```
+
+- `M`类型表示无序的映射。
+
+  ```
+  bson.M{"foo": "bar", "hello": "world", "pi": 3.14159}
+  ```
+
+- `E`类型表示D里面的一个BSON元素。
+
+- `Raw`类型代表未处理的原始BSON文档和元素，`Raw`系列类型用于验证和检索字节切片中的元素。当要查找BSON字节而不将其解编为另一种类型时，此类型最有用。
+
+### 连接到mongoDB
+
+```
+// 设置mongoDB客户端连接信息
+param := fmt.Sprintf("mongodb://XXX.XXX.XXX.XXX:27017")
+clientOptions := options.Client().ApplyURI(param)
+
+// 建立客户端连接
+client, err := mongo.Connect(context.TODO(), clientOptions)
+if err != nil {
+log.Fatal(err)
+fmt.Println(err)
+}
+
+// 检查连接情况
+err = client.Ping(context.TODO(), nil)
+if err != nil {
+log.Fatal(err)
+fmt.Println(err)
+}
+fmt.Println("Connected to MongoDB!")
+
+//指定要操作的数据集
+collection := client.Database("ccmsensor").Collection("mtr")
+
+//执行增删改查操作
+
+// 断开客户端连接
+err = client.Disconnect(context.TODO())
+if err != nil {
+log.Fatal(err)
+}
+fmt.Println("Connection to MongoDB closed.")
+```
+
+### 增查改删
+
+假如数据库中有一些网络连接数据，来自不同的APP，来自不同的ISP（运营商），类型如下：
+
+```Golang
+type CurlInfo struct {
+	DNS float64 `json:"NAMELOOKUP_TIME"` //NAMELOOKUP_TIME
+	TCP float64 `json:"CONNECT_TIME"`    //CONNECT_TIME - DNS
+	SSL float64 `json:"APPCONNECT_TIME"` //APPCONNECT_TIME - CONNECT_TIME
+}
+
+type ConnectData struct {
+	Latency  float64  `json:"latency"`
+	RespCode int      `json:"respCode"`
+	Url      string   `json:"url"`
+	Detail   CurlInfo `json:"details"`
+}
+
+type Sensor struct {
+	ISP       string
+	Clientutc int64
+	DataByAPP map[string]ConnectData
+}
+```
+
+##### 增加
+
+使用`collection.InsertOne()`来插入一条`Document`记录：
+
+```Golang
+func insertSensor(client *mongo.Client, collection *mongo.Collection) (insertID primitive.ObjectID) {
+	apps := make(map[string]ConnectData, 0)
+	apps["app1"] = ConnectData{
+		Latency:  30.983999967575,
+		RespCode: 200,
+		Url:      "",
+		Detail: CurlInfo{
+			DNS: 5.983999967575,
+			TCP: 10.983999967575,
+			SSL: 15.983999967575,
+		},
+	}
+	
+	record := &Sensor{
+		Clientutc: time.Now().UTC().Unix(),
+		ISP:       "China Mobile",
+		DataByAPP: apps,
+	}
+
+	insertRest, err := collection.InsertOne(context.TODO(), record)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	insertID = insertRest.InsertedID.(primitive.ObjectID)
+	return insertID
+}
+```
+
+##### 查询
+
+这里引入一个`filter`来匹配MongoDB数据库中的`Document`记录，使用`bson.D`类型来构建`filter`。
+
+```Golang
+timestamp := time.Now().UTC().Unix()
+start := timestamp - 180
+end := timestamp
+
+filter := bson.D{
+{"isp", isp},
+{"$and", bson.A{
+bson.D{{"clientutc", bson.M{"$gte": start}}},
+bson.D{{"clientutc", bson.M{"$lte": end}}},
+}},
+}
+```
+
+使用`collection.FindOne()`来查询单个`Document`记录。这个方法返回一个可以解码为值的结果。
+
+```Golang
+func querySensor(collection *mongo.Collection, isp string) {
+	//查询一条记录
+
+	//筛选数据
+	timestamp := time.Now().UTC().Unix()
+	start := timestamp - 1800
+	end := timestamp
+
+	filter := bson.D{
+		{"isp", isp},
+		{"$and", bson.A{
+			bson.D{{"clientutc", bson.M{"$gte": start}}},
+			bson.D{{"clientutc", bson.M{"$lte": end}}},
+		}},
+	}
+
+	var original Sensor
+	err := collection.FindOne(context.TODO(), filter).Decode(&original)
+	if err != nil {
+		fmt.Printf("%s\n", err.Error())
+	}
+	fmt.Printf("Found a single document: %+v\n", original)
+}
+```
+
+结果为刚刚插入的那一条数据，
+
+```Golang
+Connected to MongoDB!
+Found a single document: {ISP:China Mobile Clientutc:1598867346 DataByAPP:map[app1:{Latency:30.983999967575 RespCode:200 Url: Detail:{DNS:5.983999967575 TCP:10.983999967575 SSL:15.983999967575}}]}
+Connection to MongoDB closed.
+```
+
+若要提取其中的数据，在querySensor(）方法中略作改动，
+
+```
+original := make(map[string]interface{})
+var sensorData Sensor
+err := collection.FindOne(context.TODO(), filter).Decode(&original)
+if err != nil {
+	fmt.Printf("%s\n", err.Error())
+} else {
+	vstr, okstr := original["isp"].(string)
+	if okstr {
+	sensorData.ISP = vstr
+	}
+}
+```
+
+##### 更新
+
+这里仍然使用刚才的filter，并额外需要一个`update`。
+
+```
+update := bson.M{
+"$set": bson.M{
+"isp": ispAfter,
+},
+}
+```
+
+使用`collection.UpdateOne()`更新单个`Document`记录。
+
+```
+func UpdateSensor(collection *mongo.Collection, ispBefore string, ispAfter string) {
+	//修改一条数据
+
+	//筛选数据
+	timestamp := time.Now().UTC().Unix()
+	start := timestamp - 1800
+	end := timestamp
+
+	filter := bson.D{
+		{"isp", ispBefore},
+		{"$and", bson.A{
+			bson.D{{"clientutc", bson.M{"$gte": start}}},
+			bson.D{{"clientutc", bson.M{"$lte": end}}},
+		}},
+	}
+
+	//更新内容
+	update := bson.M{
+		"$set": bson.M{
+			"isp": ispAfter,
+		},
+	}
+
+	updateResult, err := collection.UpdateOne(context.TODO(), filter, update)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Matched %v documents and updated %v documents.\n", updateResult.MatchedCount, updateResult.ModifiedCount)
+}
+```
+
+##### 删除
+
+使用`collection.DeleteOne()`来删除一条记录，仍然使用刚才的filter。
+
+```
+deleteResult, err := collection.DeleteOne(context.TODO(), filter)
+if err != nil {
+	fmt.Printf("%s\n", err.Error())
+}
+```
+
+更多操作请见官方文档。
+
+###### 参考链接
+
+[1]: https://pkg.go.dev/go.mongodb.org/mongo-driver@v1.4.0	"Mongo-Driver驱动包官方文档"
+[2]: https://pkg.go.dev/go.mongodb.org/mongo-driver@v1.4.0/bson?tab=doc	"Mongo-Driver的BSON包官方文档"
+[3]: https://pkg.go.dev/go.mongodb.org/mongo-driver@v1.4.0/mongo?tab=doc	"Mongo-Driver的mongo包官方文档"
+[4]: https://pkg.go.dev/go.mongodb.org/mongo-driver@v1.4.0/mongo/options?tab=doc	"Mongo-Driver的options包官方文档"
+
