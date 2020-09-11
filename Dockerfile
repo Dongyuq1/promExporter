@@ -12,6 +12,3 @@ COPY ./golang.org /go/src/golang.org/
 EXPOSE 8710
 RUN go build -o ccm-tr-exporter .
 CMD ["/go/src/ccm/ccm-tr-exporter"]
-
-
-
